@@ -1,0 +1,5 @@
+health-checks:
+- !ping google.com
+log-level: warn
+interval: 30m
+timeout: 2s

@@ -1,0 +1,21 @@
+[package]
+name = "foreman"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.20", features = ["derive"] }
+dirs = "5.0.1"
+dns-lookup = "2.0.4"
+futures = "0.3.31"
+humantime-serde = "1.1.1"
+log = "0.4.22"
+notify-rust = "4"
+rand = "0.8.5"
+reqwest = "0.12.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+simple_logger = "5.0.0"
+surge-ping = "0.8.1"
+thiserror = "2.0.3"
+tokio = { version = "1", features = ["full"] }
