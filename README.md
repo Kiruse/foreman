@@ -5,7 +5,7 @@ Currently supported & future planned health checks:
 
 - [x] ICMP ping
 - [ ] HTTP GET
-- [ ] SSH
+- [x] SSH
 - [ ] socket.io Server
 - [ ] MongoDB
 

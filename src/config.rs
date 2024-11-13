@@ -12,14 +12,17 @@ pub struct Config {
   /// Health checks to run.
   pub health_checks: Vec<HealthCheck>,
   /// Log level. Defaults to `warn`.
-  #[serde(serialize_with = "serialize_log_level", deserialize_with = "deserialize_log_level")]
+  #[serde(default, serialize_with = "serialize_log_level", deserialize_with = "deserialize_log_level")]
   pub log_level: Option<log::LevelFilter>,
   /// Interval between health checks. Defaults to 30 minutes.
-  #[serde(with = "humantime_serde")]
+  #[serde(default, with = "humantime_serde")]
   pub interval: Option<Duration>,
   /// Timeout for each ping. Defaults to 2 seconds.
-  #[serde(with = "humantime_serde")]
+  #[serde(default, with = "humantime_serde")]
   pub timeout: Option<Duration>,
+  /// Maximum age of the server's current timestamp in seconds. Defaults to 10 seconds.
+  #[serde(default, with = "humantime_serde")]
+  pub timestamp_recency: Option<Duration>,
 }
 
 impl Config {
@@ -29,6 +32,7 @@ impl Config {
       log_level: None,
       interval: None,
       timeout: None,
+      timestamp_recency: None,
     }
   }
 
@@ -51,6 +55,7 @@ impl Config {
       log_level: other.log_level.or(self.log_level),
       interval: other.interval.or(self.interval),
       timeout: other.timeout.or(self.timeout),
+      timestamp_recency: other.timestamp_recency.or(self.timestamp_recency),
     }
   }
 }
@@ -62,6 +67,7 @@ impl Default for Config {
       log_level: Some(log::LevelFilter::Warn),
       interval: Some(Duration::from_secs(1800)),
       timeout: Some(Duration::from_secs(2)),
+      timestamp_recency: Some(Duration::from_secs(10)),
     }
   }
 }
@@ -73,7 +79,42 @@ pub enum HealthCheck {
   Ping(String),
 
   /// A simple HTTP GET request to the given URL to test liveness of a web service.
-  Http(String),
+  Http(HttpHealthCheck),
+
+  /// A simple SSH connection. Uses the `ssh` command under the hood, and thus requires it.
+  Ssh(SshHealthCheck),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct HttpHealthCheck {
+  /// URL to check.
+  pub url: String,
+  /// Expected response body. Defaults to `Timestamp`.
+  pub expect: Option<ResponseExpectation>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResponseExpectation {
+  /// Response must be the server's current timestamp in seconds.
+  /// This timestamp must be
+  Timestamp,
+
+  /// Response must match the given string exactly. This is less reliable than `Timestamp`, but
+  /// useful when you don't have control over the server's response or it isn't dynamic.
+  Body(String),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct SshHealthCheck {
+  /// URL to connect to, including user & port, in the format of `{user}@{host}:{port}`.
+  /// `user` defaults to the current user, and `port` defaults to 22.
+  pub url: String,
+  /// Private key to use for the SSH connection. Defaults to `~/.ssh/id_{user}_ed25519` or
+  /// `~/.ssh/id_{user}_rsa`, whichever exists, in this order.
+  pub identity: Option<PathBuf>,
 }
 
 fn serialize_log_level<S>(level: &Option<log::LevelFilter>, serializer: S) -> std::result::Result<S::Ok, S::Error>

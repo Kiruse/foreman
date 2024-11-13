@@ -1,4 +1,5 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
@@ -7,9 +8,10 @@ use simple_logger::SimpleLogger;
 use surge_ping::{PingIdentifier, PingSequence};
 use thiserror::Error;
 
+mod checks;
 mod config;
 
-use config::{Config, HealthCheck};
+use config::{Config, HealthCheck, HttpHealthCheck, SshHealthCheck};
 use tokio::sync::RwLock;
 
 #[derive(Debug, Error)]
@@ -23,6 +25,15 @@ pub enum Error {
   #[error("YAML error: {0}")]
   Yaml(#[from] serde_yaml::Error),
 
+  #[error("Russh error: {0}")]
+  Russh(#[from] russh::Error),
+
+  #[error("Russh keys error: {0}")]
+  RusshKeys(#[from] russh::keys::Error),
+
+  #[error("SSH error: {0}")]
+  Ssh(String),
+
   #[error("Liveness failure on {0}")]
   LivenessFailure(String),
 }
@@ -30,6 +41,10 @@ pub enum Error {
 impl Error {
   pub fn generic(msg: impl Into<String>) -> Self {
     Self::Generic(msg.into())
+  }
+
+  pub fn ssh(msg: impl Into<String>) -> Self {
+    Self::Ssh(msg.into())
   }
 }
 
@@ -90,28 +105,35 @@ async fn main() -> Result<()> {
     }
   };
 
-  let pings: Vec<String> = ctx.config.health_checks
+  let pings: Vec<_> = ctx.config.health_checks
     .iter()
     .filter_map(|hc| match hc {
       HealthCheck::Ping(host) => Some(host.clone()),
       _ => None,
     })
     .collect();
-  let http_urls: Vec<String> = ctx.config.health_checks
+  let http_checks: Vec<_> = ctx.config.health_checks
     .iter()
     .filter_map(|hc| match hc {
-      HealthCheck::Http(url) => Some(url.clone()),
+      HealthCheck::Http(hc) => Some(hc.clone()),
+      _ => None,
+    })
+    .collect();
+  let ssh_checks: Vec<_> = ctx.config.health_checks
+    .iter()
+    .filter_map(|hc| match hc {
+      HealthCheck::Ssh(hc) => Some(hc.clone()),
       _ => None,
     })
     .collect();
 
   loop {
-    if let Err(e) = check_pings(&ctx, &pings).await {
-      error!("Error pinging hosts: {}", e);
-    }
-
-    if let Err(e) = check_rest(&ctx, &http_urls).await {
-      error!("Error checking REST endpoints: {}", e);
+    if let Err(e) = tokio::try_join!(
+      check_pings(&ctx, &pings),
+      check_rest(&ctx, &http_checks),
+      check_ssh(&ctx, &ssh_checks),
+    ) {
+      error!("Error running health checks: {}", e);
     }
 
     // Sleep for 30 minutes
@@ -131,7 +153,8 @@ fn init_states(health_checks: &[HealthCheck]) -> HashMap<String, RwLock<Liveness
     .map(|hc| {
       let host = match hc {
         HealthCheck::Ping(host) => host.clone(),
-        HealthCheck::Http(url) => url.clone(),
+        HealthCheck::Http(hc) => hc.url.clone(),
+        HealthCheck::Ssh(hc) => hc.url.clone(),
       };
       (host, RwLock::new(LivenessResult::Unknown))
     })
@@ -142,38 +165,7 @@ async fn check_pings(ctx: &Context, hosts: &[String]) -> Result<()> {
   futures::future::try_join_all(
     hosts.iter().map(|host| async move {
       match ping(&ctx, host.clone()).await {
-        Ok(result) => {
-          let mut state = ctx.states.get(host).unwrap().write().await;
-          let prev = (*state).clone();
-          *state = result.clone();
-
-          if prev != result {
-            match result {
-              LivenessResult::Stable(duration) =>
-                info!("{} is up ({}ms)", host, duration.as_millis()),
-              LivenessResult::Unstable(duration, failures) =>
-                info!("{} is up ({}ms, {} failures)", host, duration.as_millis(), failures),
-              LivenessResult::Unreachable => {
-                error!("{} is down!", host);
-                notify(
-                  log::Level::Error,
-                  "Host Unreachable",
-                  format!("{} is down!", host),
-                  None,
-                );
-              }
-              LivenessResult::Unknown =>
-                error!("{} is unknown! This shouldn't happen!!", host),
-            }
-          } else if !prev.is_stable() {
-            notify(
-              log::Level::Info,
-              "Host Unstable or Unreachable",
-              format!("{} is still unstable or unreachable", host),
-              Some(2),
-            );
-          }
-        }
+        Ok(result) => update_liveness(ctx, host, result).await,
         Err(e) => {
           error!("Error pinging host {}: {}", host, e);
           notify(
@@ -185,6 +177,33 @@ async fn check_pings(ctx: &Context, hosts: &[String]) -> Result<()> {
         }
       }
       // always return Ok so the future doesn't fail
+      Ok::<(), Error>(())
+    })
+  ).await?;
+
+  Ok(())
+}
+
+async fn check_rest(_ctx: &Context, _checks: &[HttpHealthCheck]) -> Result<()> {
+  // TODO: Implement
+  Ok(())
+}
+
+async fn check_ssh(ctx: &Context, checks: &[SshHealthCheck]) -> Result<()> {
+  futures::future::try_join_all(
+    checks.iter().map(|hc| async move {
+      match crate::checks::ssh::check(ctx, hc).await {
+        Ok(result) => update_liveness(ctx, &hc.url, result).await,
+        Err(e) => {
+          error!("Error SSHing to {}: {}", hc.url, e);
+          notify(
+            log::Level::Error,
+            "Foreman Error",
+            format!("Error SSHing to {}: {}", hc.url, e),
+            None,
+          );
+        }
+      }
       Ok::<(), Error>(())
     })
   ).await?;
@@ -235,9 +254,37 @@ async fn ping(ctx: &Context, host: String) -> Result<LivenessResult> {
   }
 }
 
-async fn check_rest(_ctx: &Context, _urls: &[String]) -> Result<()> {
-  // TODO: Implement
-  Ok(())
+async fn update_liveness(ctx: &Context, host: &String, result: LivenessResult) {
+  let mut state = ctx.states.get(host).unwrap().write().await;
+  let prev = (*state).clone();
+  *state = result.clone();
+
+  if prev != result {
+    match result {
+      LivenessResult::Stable(duration) =>
+        info!("{} is up ({}ms)", host, duration.as_millis()),
+      LivenessResult::Unstable(duration, failures) =>
+        info!("{} is up ({}ms, {} failures)", host, duration.as_millis(), failures),
+      LivenessResult::Unreachable => {
+        error!("{} is down!", host);
+        notify(
+          log::Level::Error,
+          "Host Unreachable",
+          format!("{} is down!", host),
+          None,
+        );
+      }
+      LivenessResult::Unknown =>
+        error!("{} is unknown! This shouldn't happen!!", host),
+    }
+  } else if !prev.is_stable() {
+    notify(
+      log::Level::Info,
+      "Host Unstable or Unreachable",
+      format!("{} is still unstable or unreachable", host),
+      Some(10),
+    );
+  }
 }
 
 fn notify(

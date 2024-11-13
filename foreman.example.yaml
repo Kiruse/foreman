@@ -1,5 +1,9 @@
 health-checks:
 - !ping google.com
+- http:
+    url: https://example.com
+- ssh:
+    url: user@example.com:22322
 log-level: warn
 interval: 30m
 timeout: 2s
