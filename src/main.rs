@@ -68,6 +68,25 @@ impl LivenessResult {
   pub fn is_stable(&self) -> bool {
     matches!(self, LivenessResult::Stable(_))
   }
+
+  pub fn is_unstable(&self) -> bool {
+    matches!(self, LivenessResult::Unstable(_, _))
+  }
+
+  pub fn is_unreachable(&self) -> bool {
+    matches!(self, LivenessResult::Unreachable)
+  }
+
+  pub fn is_unknown(&self) -> bool {
+    matches!(self, LivenessResult::Unknown)
+  }
+
+  pub fn is_same_variant(first: &Self, second: &Self) -> bool {
+    first.is_stable() == second.is_stable() &&
+      first.is_unstable() == second.is_unstable() &&
+      first.is_unreachable() == second.is_unreachable() &&
+      first.is_unknown() == second.is_unknown()
+  }
 }
 
 struct Context {
@@ -259,31 +278,51 @@ async fn update_liveness(ctx: &Context, host: &String, result: LivenessResult) {
   let prev = (*state).clone();
   *state = result.clone();
 
-  if prev != result {
-    match result {
-      LivenessResult::Stable(duration) =>
-        info!("{} is up ({}ms)", host, duration.as_millis()),
-      LivenessResult::Unstable(duration, failures) =>
-        info!("{} is up ({}ms, {} failures)", host, duration.as_millis(), failures),
-      LivenessResult::Unreachable => {
-        error!("{} is down!", host);
-        notify(
-          log::Level::Error,
-          "Host Unreachable",
-          format!("{} is down!", host),
-          None,
-        );
+  match result {
+    LivenessResult::Stable(duration) =>
+      info!("{} is up ({}ms)", host, duration.as_millis()),
+    LivenessResult::Unstable(duration, failures) =>
+      info!("{} is up ({}ms, {} failures)", host, duration.as_millis(), failures),
+    LivenessResult::Unreachable =>
+      error!("{} is down!", host),
+    LivenessResult::Unknown =>
+      error!("{} is unknown! This shouldn't happen!!", host),
+  }
+
+  if !prev.is_unknown() {
+    if !LivenessResult::is_same_variant(&prev, &result) {
+      match result {
+        LivenessResult::Stable(_) =>
+          notify(
+            log::Level::Info,
+            "Host Recovered",
+            format!("{} is back up", host),
+            Some(10),
+          ),
+        LivenessResult::Unstable(_, _) =>
+          notify(
+            log::Level::Info,
+            "Host Unstable",
+            format!("{} is unstable", host),
+            Some(10),
+          ),
+        LivenessResult::Unreachable =>
+          notify(
+            log::Level::Error,
+            "Host Unreachable",
+            format!("{} is unreachable", host),
+            None,
+          ),
+        _ => {}
       }
-      LivenessResult::Unknown =>
-        error!("{} is unknown! This shouldn't happen!!", host),
+    } else if !prev.is_stable() {
+      notify(
+        log::Level::Info,
+        "Host remains Unstable or Unreachable",
+        format!("{} is still unstable or unreachable", host),
+        Some(10),
+      );
     }
-  } else if !prev.is_stable() {
-    notify(
-      log::Level::Info,
-      "Host Unstable or Unreachable",
-      format!("{} is still unstable or unreachable", host),
-      Some(10),
-    );
   }
 }
 
